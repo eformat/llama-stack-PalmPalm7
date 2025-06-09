@@ -1,0 +1,107 @@
+name: Integration Tests
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'llama_stack/**'
+      - 'tests/integration/**'
+      - 'uv.lock'
+      - 'pyproject.toml'
+      - 'requirements.txt'
+      - '.github/workflows/integration-tests.yml' # This workflow
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-matrix:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # Listing tests manually since some of them currently fail
+        # TODO: generate matrix list from tests/integration when fixed
+        test-type: [agents, inference, datasets, inspect, scoring, post_training, providers]
+        client-type: [library, http]
+      fail-fast: false # we want to run all tests regardless of failure
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@0c5e2b8115b80b4c7c5ddf6ffdd634974642d182 # v5.4.1
+        with:
+          python-version: "3.10"
+
+      - name: Install and start Ollama
+        run: |
+          # the ollama installer also starts the ollama service
+          curl -fsSL https://ollama.com/install.sh | sh
+
+      - name: Pull Ollama image
+        run: |
+          # TODO: cache the model. OLLAMA_MODELS defaults to ~ollama/.ollama/models.
+          ollama pull llama3.2:3b-instruct-fp16
+
+      - name: Set Up Environment and Install Dependencies
+        run: |
+          uv sync --extra dev --extra test
+          uv pip install ollama faiss-cpu
+          # always test against the latest version of the client
+          # TODO: this is not necessarily a good idea. we need to test against both published and latest
+          # to find out backwards compatibility issues.
+          uv pip install git+https://github.com/meta-llama/llama-stack-client-python.git@main
+          uv pip install -e .
+          llama stack build --template ollama --image-type venv
+
+      - name: Start Llama Stack server in background
+        if: matrix.client-type == 'http'
+        env:
+          INFERENCE_MODEL: "meta-llama/Llama-3.2-3B-Instruct"
+        run: |
+          source .venv/bin/activate
+          nohup uv run llama stack run ./llama_stack/templates/ollama/run.yaml --image-type venv > server.log 2>&1 &
+
+      - name: Wait for Llama Stack server to be ready
+        if: matrix.client-type == 'http'
+        run: |
+          echo "Waiting for Llama Stack server..."
+          for i in {1..30}; do
+            if curl -s http://localhost:8321/v1/health | grep -q "OK"; then
+              echo "Llama Stack server is up!"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Llama Stack server failed to start"
+          cat server.log
+          exit 1
+
+      - name: Verify Ollama status is OK
+        if: matrix.client-type == 'http'
+        run: |
+          echo "Verifying Ollama status..."
+          ollama_status=$(curl -s -L http://127.0.0.1:8321/v1/providers/ollama|jq --raw-output .health.status)
+          echo "Ollama status: $ollama_status"
+          if [ "$ollama_status" != "OK" ]; then
+            echo "Ollama health check failed"
+            exit 1
+          fi
+
+      - name: Run Integration Tests
+        env:
+          INFERENCE_MODEL: "meta-llama/Llama-3.2-3B-Instruct"
+        run: |
+          if [ "${{ matrix.client-type }}" == "library" ]; then
+            stack_config="ollama"
+          else
+            stack_config="http://localhost:8321"
+          fi
+          uv run pytest -v tests/integration/${{ matrix.test-type }} --stack-config=${stack_config} \
+            -k "not(builtin_tool or safety_with_image or code_interpreter or test_rag)" \
+            --text-model="meta-llama/Llama-3.2-3B-Instruct" \
+            --embedding-model=all-MiniLM-L6-v2
