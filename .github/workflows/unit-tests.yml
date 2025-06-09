@@ -37,7 +37,7 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
 
-      - uses: astral-sh/setup-uv@0c5e2b8115b80b4c7c5ddf6ffdd634974642d182 # v5.4.1
+      - uses: astral-sh/setup-uv@252c9954247a3257f40af94d0d836d0ffb58f808 # v5.4.1
         with:
           python-version: ${{ matrix.python }}
           enable-cache: false
